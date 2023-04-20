@@ -23,23 +23,28 @@
 
 // ************************************** pin declaration *******************************************************
 // Diameter Control
-const int diaSensorPin = 16;  // analog pin for reading diameter from the bearing sensor
+const int diaSensorPin = A1;  // analog pin for reading diameter from the bearing sensor
+const int winderMotor = 31;
 
 // Themp Control
-const int thermistorNozzle = A17;  // aka pin 41; thermistor on the nozzle
-const int thermistorMid = A15;     // aka pin 40; thermistor in between the two heaters
-const int thermistorTip = A16;     // aka pin 39; thermistor between nozzle and heaters
-const int thermistorHopper = A14;  // aka pin 38; thermistor at the base of the hopper
+const int thermistorNozzle = A15;  // aka pin 41; thermistor on the nozzle
+const int thermistorMid = A14;     // aka pin 40; thermistor in between the two heaters
+const int thermistorTip = A17;     // aka pin 39; thermistor between nozzle and heaters
+const int thermistorHopper = A16;  // aka pin 38; thermistor at the base of the hopper
 
-const int heatSleevesPin = 30;  // Heater sleeves output pin
-const int augerFanPin = 29;     // PWM control for the auger fan
-const int filFanPin = 31;       // filament cooling fans output pin (unused)
+const int heatSleevesPin = 32;  // Heater sleeves output pin
+const int augerFanPin = -1;     // PWM control for the auger fan
+const int filFanPin = -1;
 
 // User I/O
-const int leftButton = 3;
+const int leftButton = 1;
 const int rightButton = 2;
-const int xButton = 4;
-const int selectButton = 5;  // UI button pins
+const int xButton = 0;
+const int selectButton = 3;  // UI button pins
+#define BUTTON_ACTIVE_STATE LOW
+
+const int potPin1 = A9;  // pin 23 for potentiometer
+
 const int greenLED = 22;
 const int yellowLED = 21;
 const int redLED = 20;  // UI LED output pins
@@ -59,8 +64,10 @@ unsigned long lastXButtonPress = 0;
 
 
 // Vars for Diameter Control moving averages ************************************
-#define NUMSAMPLES_dia 50
+#define NUMSAMPLES_dia 500
+#define DIA_FILTER_T 10    //seconds
 int samples_dia[NUMSAMPLES_dia];
+int diaSampleTimer = 0;
 float averageDia;
 double userDia = 1.75;
 double realDia;
@@ -120,9 +127,14 @@ const int lowerTempBoundary = 1;  // if temp is this much below target temp, tur
 // =====================================================================================
 
 //--------------------------- initialize LCD library -----------------------------------
-#include <LiquidCrystal_I2C.h>       // includes the library
-LiquidCrystal_I2C lcd(0x27, 20, 4);  // creates our 20x4 lcd object with I2C address 0x27
+//#include <LiquidCrystal_I2C.h>       // includes the library
+//LiquidCrystal_I2C lcd(0x27, 20, 4);  // creates our 20x4 lcd object with I2C address 0x27
 
+
+#include <Wire.h>
+#include <hd44780.h>                        // main hd44780 header
+#include <hd44780ioClass/hd44780_I2Cexp.h>  // i2c expander i/o class header
+hd44780_I2Cexp lcd;                         // declare lcd object: auto locate & auto config expander chip
 
 // ========================= MOTOR CONTROL CONSTANTS =======================
 //--------------------------- initialize PID library ------------------------------------
@@ -132,17 +144,17 @@ ArduPID diaPID;
 double setpoint;      // var to which we will assign our target diameter
 double diaInput;      // parameter which we are trying to get to setpoint
 double pullerOutput;  // var which we will map to motor speed
-double p = 0.001;     // proportional (const)
-double i = 0.001;     // integral term (const)
-double d = 0.25;      // derivative term (const)
+double p = 0.0001;       // proportional (const)
+double i = 0.0003;     // integral term (const)
+double d = 50000;       // derivative term (const)
 
 ArduPID tempPID;
 double tempSetpoint;
 double tempInput;
 double tempOutput;
-double p1 = 1;
-double i1 = 0.01;
-double d1 = 0.01;
+double p1 = 20;
+double i1 = 0.0;
+double d1 = 0.0;
 
 unsigned long lastTempChange;
 double dutyCycle;
@@ -157,12 +169,15 @@ int motorSpeed = 0;         // var to hold the commanded motor speed
 int prevMotorSpeed = 0;     // var to hold value the last time we updated the motor speed input
 int speedChangeBuffer = 5;  // if motorspeed is less than 5 from prevMotorSpeed, we don't change anything
 
-const int maxMotorSpeed = 600;  // max and min puller motor speeds
-const int minMotorSpeed = 200;
+const int maxMotorSpeed = 2000;  // max and min puller motor speeds
+const int minMotorSpeed = 150;
 
 const int stepDirPin = 35;     // direction pin for stepper driver
 const int stepStepPin = 34;    // step pin for stepper driver
 const int stepEnablePin = 33;  // enable pin (LOW == ENABLED)
+
+int motorSpeedScaled;
+int winderSpeed = 255;
 
 
 // ----------------------------------------------------- State Machine ----------------------------------------------------
@@ -202,6 +217,9 @@ Menu menu = DIA;
 Extruding extruding = NOTHING;
 
 void setup() {
+  pinMode(winderMotor, OUTPUT);
+  analogWrite(winderMotor, winderSpeed);
+
   Serial.begin(9600);  // Note: Teensy doesn't use the baud rate
 
   // init. diameter PID
@@ -247,7 +265,7 @@ void setup() {
 
   // set start points for user inputs
   userDia = 1.75;
-  userTemp = 210;
+  userTemp = 208;
 
   //initializes the lcd and turns on the backlight
   lcd.init();
@@ -332,7 +350,7 @@ void loop() {
 
               // exit conditions
               // If user hits select, move to the next state
-              if (Debounce(digitalRead(selectButton), &lastSelectButtonPress) == HIGH) {  // simplify by using button library
+              if (Debounce(digitalRead(selectButton), &lastSelectButtonPress)) {  // simplify by using button library
                 // Serial.print("select button pushed");
 
                 menu = PRINT_DIA;  // move to next menu state
@@ -395,7 +413,7 @@ void loop() {
               lcd.print(userDia);
 
               // exit condition if select is pressed.                                           // replace this with button library stuff
-              if (Debounce(digitalRead(selectButton), &lastSelectButtonPress) == HIGH) {
+              if (Debounce(digitalRead(selectButton), &lastSelectButtonPress)) {
                 Serial.println("select Button Pressed");
                 menu = PRINT_CONFIRM;
               }
@@ -441,12 +459,12 @@ void loop() {
               safteyHeatCheck(TempMid, 50);
 
               //exit ccondition 1, sends user to pre heating stage if select pressed
-              if (Debounce(digitalRead(selectButton), &lastSelectButtonPress) == HIGH) {
+              if (Debounce(digitalRead(selectButton), &lastSelectButtonPress)) {
                 //                        Serial.println("select Button Pressed");
                 state = PRINT_PRE_HEAT;
               }
               // exit condition 2, allows user to change inputs again if x pressed
-              if (Debounce(digitalRead(xButton), &lastXButtonPress) == HIGH) {
+              if (Debounce(digitalRead(xButton), &lastXButtonPress)) {
                 //                        Serial.println("x button Pressed");
                 menu = PRINT_TEMP;
               }
@@ -502,7 +520,7 @@ void loop() {
         getAllTemps();                 //reads all temperatures using the getTemp() function
         safteyHeatCheck(TempMid, 50);  // call safetyHeatCheck to monitor temp limits and warn user if appropriate
         printAllTemps();               // [for debugging] prints all Temp readouts to serial monitor
-        ControlTemp(TempAvgAB);        // manages Heat sleeves using A and B temp averages
+        ControlTemp(TempMid);          // manages Heat sleeves using A and B temp averages
 
 
         // exit condition 1
@@ -510,7 +528,7 @@ void loop() {
            This occurs when the NOZZLE temperature reaches the userTemp.
            At this point, we turn off the yellow LED and move directly to PRINT_EXTRUDING
         */
-        if (TempNozzle >= userTemp) {
+        if (TempNozzle >= userTemp - 50) {
           //turns yellow LED off
           digitalWrite(yellowLED, LOW);
           lcd.clear();
@@ -518,7 +536,7 @@ void loop() {
         }
 
         // exit condition 2, if user wants to cancel preheat completely, can push xButton to return input stage
-        if (Debounce(digitalRead(xButton), &lastXButtonPress) == HIGH) {  // button library!!!
+        if (Debounce(digitalRead(xButton), &lastXButtonPress)) {  // button library!!!
           Serial.println("x Button Pressed");
           lcd.clear();
           lcd.setCursor(0, 0);
@@ -575,7 +593,7 @@ void loop() {
       {
 
         //condition to enter into
-        if (Debounce(digitalRead(selectButton), &lastSelectButtonPress) == HIGH) {
+        if (Debounce(digitalRead(selectButton), &lastSelectButtonPress)) {
           extruding = PRINT_ADJUST_TEMP;
         }
 
@@ -603,7 +621,7 @@ void loop() {
               // reads user input
               userTemp = Increment(userTemp, MaxTemp, MinTemp);
 
-              if (Debounce(digitalRead(selectButton), &lastSelectButtonPress) == HIGH) {
+              if (Debounce(digitalRead(selectButton), &lastSelectButtonPress)) {
                 extruding = PRINT_ADJUST_DIA;
               }
             }
@@ -629,7 +647,7 @@ void loop() {
               //user Dia goes back to decimal form for lcd printing
               userDia = userDia / 100;
 
-              if (Debounce(digitalRead(selectButton), &lastSelectButtonPress) == HIGH) {
+              if (Debounce(digitalRead(selectButton), &lastSelectButtonPress)) {
                 lcd.setCursor(0, 2);
                 lcd.print(" ");
                 extruding = NOTHING;
@@ -645,7 +663,7 @@ void loop() {
 
 
         //this bit serial print of code is here for testing purposes
-        printAllTemps();
+        // printAllTemps();
         getAllTemps();  //reads all temperatures using the getTemp() function
         safteyHeatCheck(TempMid, 50);
 
@@ -654,69 +672,14 @@ void loop() {
         //manages Heat sleeve temp, (i.e. turns them off if system gets to hot!)
         ControlTemp(TempAvgAB);
 
-
         //========================================================= MOTOR CONTROL CODE =====================================================//
 
-        //gets reading for the actual diameter of the filament
-        setpoint = userDia;
+        ControlDiameter();
+        ControlWinder();
 
-        diaInput = getDia();
-        //computes PID
-        diaPID.compute();
+        printDiameters();
+        printAllTemps();
 
-        //this does diameter control!!!!!!!!
-
-        motorSpeed = map(pullerOutput, 0, 255, maxMotorSpeed, minMotorSpeed);  //motorSpeed - (pullerOutput - 124);
-
-        // The PID outputs a value between 0 and 255 with 124 being the value when we are spot-on
-        // So what this does it it takes current speed and increments speed up or down depending on the PID output
-        // when we reach steady state, the PID will be outputting a constant 124 and speed will also remain constant
-        // adjust P, I, and D values (found where PID is initialized, approx line 105) to adjust PID response rate
-
-        //This code prevents motorSpeed from become negative or becoming larger than maximum allowable speed (set where PID is set up)
-        if (motorSpeed < 0) {
-          motorSpeed = 0;
-        }
-        //        if (motorSpeed > maxMotorSpeed) {
-        //          motorSpeed = maxMotorSpeed;
-        //        }
-        //        if (motorSpeed < minMotorSpeed){
-        //          motorSpeed = minMotorSpeed;
-        //        }
-
-
-        if (prevMotorSpeed <= motorSpeed - speedChangeBuffer || prevMotorSpeed >= motorSpeed + speedChangeBuffer) {
-          stepper.spin(motorSpeed);
-          //Serial.println("=== Speed Change ===");
-          prevMotorSpeed = motorSpeed;
-        }
-
-// This is a section of code that will print setpoint and diameter for tuning the diameter PID control
-        //        if (millis() - lastPrintDia > 1000) {
-        //          Serial.print("Dia_Setpoint:");
-        //          Serial.print(setpoint);
-        //          Serial.print(",");
-        //          Serial.print("Diameter:");
-        //          Serial.println(diaInput);
-        //          //        Serial.print("PID_Output:");
-        //          //        Serial.print(pullerOutput);
-        //          //        Serial.print(",");
-        //          //        Serial.print("Motor_Command:");
-        //          //        Serial.println(motorSpeed);
-        //          lastPrintDia = millis();
-        //        }
-
-        //this code simply disables the stepper driver if the motor speed is below a certain threshold. This prevents the driver buzzing and being annoying but isn't too important.
-        if (motorSpeed < 40) {
-          digitalWrite(stepEnablePin, HIGH);
-          Serial.println("Motor Disabled");
-        } else {
-          digitalWrite(stepEnablePin, LOW);
-        }
-
-        //for debugging:
-        //Serial.println(pullerOutput);
-        //Serial.println(motorSpeed);
 
         //--------------------------------------------------- end motor control code -----------------------------------------------------//
 
@@ -731,9 +694,8 @@ void loop() {
         lcd.print(diaInput);
 
 
-
         // exit condition, when user hits X button, system will restart
-        if (Debounce(digitalRead(xButton), &lastXButtonPress) == HIGH) {
+        if (Debounce(digitalRead(xButton), &lastXButtonPress)) {
           digitalWrite(greenLED, LOW);
           //                 Serial.println("x Button Pressed");
           digitalWrite(stepEnablePin, HIGH);  // disable stepper
@@ -777,7 +739,7 @@ void loop() {
 
 
         // exit condition for DONE state
-        if (Debounce(digitalRead(selectButton), &lastSelectButtonPress) == HIGH) {
+        if (Debounce(digitalRead(selectButton), &lastSelectButtonPress)) {
           Serial.println("encoder Button Pressed");
           state = USER;
           menu = PRINT_TEMP;
@@ -806,12 +768,15 @@ void safteyHeatCheck(double temp, double threshold) {
   }
 }
 
-
-int Debounce(int raspberry, unsigned long* lastButtonPress) {
+bool Debounce(int buttonRead, unsigned long* lastButtonPress) {
   // debounces any button
-  int ret = 0;
+  int ret = false;
   if (millis() - *lastButtonPress > 250) {
-    ret = raspberry;
+    if (buttonRead == BUTTON_ACTIVE_STATE) {
+      ret = true;
+    } else {
+      ret = false;
+    }
     *lastButtonPress = millis();
   }
   //lastButtonPress = millis();
@@ -871,12 +836,17 @@ double getTemp(int pin) {
 double getDia() {
   //take N samples in a row, with a slight delay
   //place them into the samples[] array
+  if (diaSampleTimer < millis()){
 
-  for (int i = 0; i < NUMSAMPLES_dia; i++) {
-    samples_dia[i] = analogRead(diaSensorPin);
-    //Serial.println(analogRead(diaSensorPin));
+    //shift ring buffer:
+    for (int i = NUMSAMPLES_dia - 1; i > 0; i--) {
+      //samples_dia[i] = analogRead(diaSensorPin);
+      //Serial.println(analogRead(diaSensorPin));
+      samples_dia[i] = samples_dia[i - 1];
+    }
+    samples_dia[0] = analogRead(diaSensorPin);
+    diaSampleTimer = millis() + ((DIA_FILTER_T * 1000) / NUMSAMPLES_dia );
   }
-
   // average all the datapoints in samples[] out
   averageDia = 0;
   for (int i = 0; i < NUMSAMPLES_dia; i++) {  //sum all the samples
@@ -886,7 +856,8 @@ double getDia() {
   averageDia /= NUMSAMPLES_dia;  //divide by numSamples
 
 
-  realDia = 1.74 + 0.0108 * (averageDia) - (4.76E-05) * (averageDia) * (averageDia);
+  //realDia = 1.74 + 0.0108 * (averageDia) - (4.76E-05) * (averageDia) * (averageDia);
+  realDia = 1.89 + 0.0108 * (averageDia) - (4.76E-05) * (averageDia) * (averageDia);
   if (averageDia < 100) {
     realDia = 2.40;
   }
@@ -907,9 +878,9 @@ double Increment(int butter, int MAX, int MIN) {
      Butter is the name of the variable which
   */
 
-  if (digitalRead(leftButton) == HIGH) {
+  if (digitalRead(leftButton) == BUTTON_ACTIVE_STATE) {
     if (millis() - lastLeftButtonPress > 100) {
-      if (digitalRead(xButton) == HIGH) {
+      if (digitalRead(xButton) == BUTTON_ACTIVE_STATE) {
         butter = butter - 10;
       } else {
         butter--;
@@ -924,9 +895,9 @@ double Increment(int butter, int MAX, int MIN) {
     //lastButtonPress = millis();
   }
 
-  if (digitalRead(rightButton) == HIGH) {
+  if (digitalRead(rightButton) == BUTTON_ACTIVE_STATE) {
     if (millis() - lastRightButtonPress > 100) {
-      if (digitalRead(xButton) == HIGH) {
+      if (digitalRead(xButton) == BUTTON_ACTIVE_STATE) {
         butter = butter + 10;
       } else {
         butter++;
@@ -943,6 +914,69 @@ double Increment(int butter, int MAX, int MIN) {
   return butter;
 }
 
+
+
+//------------------------- Function ControlDiameter --------------------------
+void ControlDiameter() {
+  //gets reading for the actual diameter of the filament
+  setpoint = userDia;
+
+  diaInput = getDia();
+  //computes PID and maps to motor output
+  diaPID.compute();
+  motorSpeed = map(pullerOutput, 0, 255, maxMotorSpeed, minMotorSpeed);
+  motorSpeedScaled = map(motorSpeed, minMotorSpeed, maxMotorSpeed, 0, 100);
+
+
+  // The PID outputs a value between 0 and 255 (with 124 being the value when we are spot-on?)
+  // So what this does it it takes current speed and increments speed up or down depending on the PID output
+  // when we reach steady state, the PID will be outputting a constant 124 and speed will also remain constant
+  // adjust P, I, and D values (found where PID is initialized, approx line 105) to adjust PID response rate
+
+  //This code prevents motorSpeed from becoming negative or becoming larger than maximum allowable speed (set where PID is set up)
+  if (motorSpeed < 0) {
+    motorSpeed = 0;
+  }
+  if (motorSpeed > maxMotorSpeed) {
+    motorSpeed = maxMotorSpeed;
+    Serial.println("Maximum Motor Command Exceeded");
+  }
+  if (motorSpeed < minMotorSpeed) {
+    motorSpeed = minMotorSpeed;
+  }
+
+  if (prevMotorSpeed <= motorSpeed - speedChangeBuffer || prevMotorSpeed >= motorSpeed + speedChangeBuffer) {
+    stepper.spin(motorSpeed);
+    //Serial.println("=== Speed Change ===");
+    prevMotorSpeed = motorSpeed;
+  }
+
+
+  //this code simply disables the stepper driver if the motor speed is below a certain threshold. This prevents the driver buzzing and being annoying but isn't too important.
+  if (motorSpeed < 40) {
+    digitalWrite(stepEnablePin, HIGH);
+    Serial.println("Motor Disabled");
+  } else {
+    digitalWrite(stepEnablePin, LOW);
+  }
+}
+
+void ControlWinder() {
+
+  if (stepEnablePin == LOW) {
+    double scalingFactor = map(analogRead(potPin1), 0, 1024, 0, 1);
+
+    winderSpeed = (55 + 200 * motorSpeedScaled / 100) * scalingFactor;
+
+  } else {
+    winderSpeed = 0;
+  }
+  //analogWrite(winderMotor, analogRead(potPin1));
+  digitalWrite(winderMotor, LOW);
+  // Serial.print("winderSpeed:");
+  // Serial.println(analogRead(potPin1));
+}
+
 // ------------------------ Function ControlTemp() ---------------------------
 // Controls the heater sleeves based on input temperature
 void ControlTemp(double temp) {
@@ -955,18 +989,19 @@ void ControlTemp(double temp) {
 
   //this does temp control!!!!!!!!
 
-  dutyCycle = map(tempOutput, 0, 255, 0, 1); 
+  dutyCycle = map(tempOutput, 0, 255, 0, 1);
 
-    // Serial.println(dutyCycle);
 
-    // The PID outputs a value between 0 and 255 with 124 being the value when we are spot-on
-    // So what this does it it takes current temp and if temp is less than setpoint, dutyCycle will be close to 1
-    // When temp is greater than setpoint, dutyCycle will be closer to 0
-    // adjust P, I, and D values (found where PID is initialized, approx line 105) to adjust PID response rate
+  // Serial.println(dutyCycle);
 
-    currentTime = millis();
-  if (currentTime - lastTempChange < dutyCycle*tempPeriod) {  // only check/adjust heater state every 0.333 seconds
-    digitalWrite(heatSleevesPin, HIGH);        // the heat sleeves will be turned off
+  // The PID outputs a value between 0 and 255 with 124 being the value when we are spot-on
+  // So what this does it it takes current temp and if temp is less than setpoint, dutyCycle will be close to 1
+  // When temp is greater than setpoint, dutyCycle will be closer to 0
+  // adjust P, I, and D values (found where PID is initialized, approx line 105) to adjust PID response rate
+
+  currentTime = millis();
+  if (currentTime - lastTempChange < dutyCycle * tempPeriod) {  // only check/adjust heater state every 0.333 seconds
+    digitalWrite(heatSleevesPin, HIGH);                         // the heat sleeves will be turned off
     // Serial.println("Heaters on");
   } else if (currentTime - lastTempChange < tempPeriod) {
     digitalWrite(heatSleevesPin, LOW);
@@ -974,6 +1009,9 @@ void ControlTemp(double temp) {
   } else if (currentTime - lastTempChange > tempPeriod) {
     lastTempChange = millis();
     // Serial.println("Next Cycle!");
+    // Serial.print("dutyCycle:");
+    // Serial.print(dutyCycle);
+    // Serial.print(",");
   }
 }
 
@@ -1006,7 +1044,7 @@ void printWelcomeScreen() {
 // --------------------------- Serial Print Code ---------------------------------
 void printAllTemps() {
   //this bit serial print of code is here for testing purposes
-  if (millis() - lastSerialPrint > 2000) {
+  if (millis() - lastSerialPrint > 500) {
     Serial.print("TempNozzle:");
     Serial.print(TempNozzle);
     Serial.print(",");
@@ -1017,13 +1055,38 @@ void printAllTemps() {
     Serial.print(TempTip);
     Serial.print(",");
 
-    Serial.print("TempAvgAB:");
-    Serial.print(TempAvgAB);
-    Serial.print(",");
+    // Serial.print("TempAvgAB:");
+    // Serial.print(TempAvgAB);
+    // Serial.print(",");
 
     Serial.print("TempHopper:");
     Serial.print(TempHopper);
     Serial.println("");
+
     lastSerialPrint = millis();
+  }
+}
+
+void printDiameters() {
+
+  // This is a section of code that will print setpoint and diameter for tuning the diameter PID control
+  if (millis() - lastPrintDia > 500) {
+
+    Serial.print("Dia_Setpoint:");
+    Serial.print(setpoint * 100);
+    Serial.print(",");
+    Serial.print("Diameter:");
+    Serial.print(diaInput * 100);
+    Serial.print(",");
+    Serial.print("PID_Output:");
+    Serial.print(pullerOutput);
+    Serial.print(",");
+    Serial.print("Motor_Command%:");
+    Serial.print(motorSpeedScaled);
+    // Serial.print(",");
+    // Serial.print("Winder_Speed:");
+    // Serial.print(winderSpeed);
+    Serial.println("");
+    lastPrintDia = millis();
   }
 }
